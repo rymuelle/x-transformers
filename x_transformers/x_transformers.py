@@ -695,6 +695,7 @@ class PerRowDataDependentAlibi(Module):
 
         return forget_gates
 
+# rotary_pos_emb
 class RotaryEmbedding(Module):
     def __init__(
         self,
@@ -703,7 +704,9 @@ class RotaryEmbedding(Module):
         scale_base = 512,
         interpolation_factor = 1.,
         base = 10000,
-        base_rescale_factor = 1.
+        base_rescale_factor = 1.,
+        axial_rotary_embed = False,
+        
     ):
         super().__init__()
         # proposed by reddit user bloc97, to rescale rotary embeddings to longer sequence length without fine-tuning
@@ -712,6 +715,9 @@ class RotaryEmbedding(Module):
         base *= base_rescale_factor ** (dim / (dim - 2))
 
         inv_freq = 1. / (base ** (arange(0, dim, 2).float() / dim))
+        self.axial_rotary_embed = axial_rotary_embed
+        if axial_rotary_embed: 
+            inv_freq = 1. / (10000 ** (arange(0, dim, 4)[: (dim // 4)].float() / dim))
         self.register_buffer('inv_freq', inv_freq)
 
         assert interpolation_factor >= 1.
@@ -740,8 +746,9 @@ class RotaryEmbedding(Module):
             t = rearrange(t, 'n -> 1 n')
 
         freqs = torch.einsum('b i , j -> b i j', t.type_as(self.inv_freq), self.inv_freq) / self.interpolation_factor
-        freqs = stack((freqs, freqs), dim = -1)
-        freqs = rearrange(freqs, '... d r -> ... (d r)')
+        if not self.axial_rotary_embed:
+            freqs = stack((freqs, freqs), dim = -1)
+            freqs = rearrange(freqs, '... d r -> ... (d r)')
 
         if not exists(self.scale):
             return freqs, 1.
@@ -759,6 +766,7 @@ def rotate_half(x):
     x = stack((-x2, x1), dim = -1)
     return rearrange(x, '... d r -> ... (d r)')
 
+# rotary_pos_emb
 @autocast('cuda', enabled = False)
 def apply_rotary_pos_emb(t, freqs, scale = 1):
     rot_dim, seq_len, orig_dtype = freqs.shape[-1], t.shape[-2], t.dtype
@@ -1816,6 +1824,7 @@ class Attention(Module):
         attn_mask = None,
         rel_pos = None,
         attn_bias = None,
+        # rotary_pos_emb
         rotary_pos_emb = None,
         context_rotary_pos_emb = None,
         polar_pos_emb = None,
@@ -1945,6 +1954,7 @@ class Attention(Module):
                 mem_len = mem.shape[-2] if exists(mem) else 0
                 cached_kv = (k[..., mem_len:, :], v[..., mem_len:, :])
 
+        # rotary_pos_emb
         if exists(rotary_pos_emb):
             rotate_num_heads = self.rotate_num_heads
             partial_rotate_heads = rotate_num_heads < h
@@ -2246,6 +2256,7 @@ class AttentionLayers(Module):
         dynamic_pos_bias_log_distance = False,
         dynamic_pos_bias_mlp_depth = 2,
         dynamic_pos_bias_norm = False,
+        # rotary_pos_emb
         rotary_pos_emb = False,
         rotary_emb_dim = None,
         rotary_xpos = False,
@@ -2294,6 +2305,7 @@ class AttentionLayers(Module):
         **kwargs
     ):
         super().__init__()
+        # rotary_pos_emb
         rotary_pos_emb = rotary_pos_emb or rotary_xpos
 
         ff_kwargs, kwargs = groupby_prefix_and_trim('ff_', kwargs)
@@ -2337,7 +2349,7 @@ class AttentionLayers(Module):
         assert not (qkv_receive_diff_residuals and not (hyper_conn_produce_diff_views or integrate_layers))
 
         # positions related
-
+        # rotary_pos_emb
         self.disable_abs_pos_emb = default(disable_abs_pos_emb, (rel_pos_bias or rotary_pos_emb or polar_pos_emb))
 
         rotary_emb_dim = default(rotary_emb_dim, dim_head // 2)
@@ -2346,7 +2358,7 @@ class AttentionLayers(Module):
 
         if verbose and rotary_emb_dim < 32:
             logger.warning('when training language model, rotary embedding dimension should be at least 32')
-
+        # rotary_pos_emb
         assert at_most_one_of(rotary_pos_emb, polar_pos_emb), f'either rotary positional embedding or polar positional embedding can be turned on'
         assert not (rotary_xpos and not causal), 'rotary xpos is not compatible with bidirectional attention'
         self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim, use_xpos = rotary_xpos, scale_base = rotary_xpos_scale_base, interpolation_factor = rotary_interpolation_factor, base_rescale_factor = rotary_base_rescale_factor) if rotary_pos_emb else None
@@ -2711,6 +2723,7 @@ class AttentionLayers(Module):
         input_not_include_cache = False,
         cache_age = 1,
         return_hiddens = False,
+        # rotary_pos_emb
         rotary_pos_emb = None,
         polar_pos_emb = None,
         pos = None,
@@ -2784,7 +2797,7 @@ class AttentionLayers(Module):
                 self_attn_kv_mask = left_pad_mask
 
         # rotary positions
-
+        # rotary_pos_emb
         cross_attn_rotary_pos_emb = dict()
 
         if exists(self.rotary_pos_emb):
@@ -3006,6 +3019,7 @@ class AttentionLayers(Module):
             # forward depending on layer type
 
             if layer_type == 'a':
+                # rotary_pos_emb
                 out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, pos = pos, rotary_pos_emb = rotary_pos_emb, polar_pos_emb = polar_pos_emb, additional_key_values = next(iter_self_attn_kv, None), additional_key_value_mask = additional_kv_mask, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, mem_mask = layer_mem_mask, attn_bias = attn_bias, kv_input_residual = next(self_attn_kv_residuals_iter, None), value_residual = maybe_self_attn_value_residual, return_intermediates = True)
             elif layer_type == 'c':
                 out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn, cache = next(iter_attn_cache, None), kv_input_residual = next(cross_attn_kv_residuals_iter, None), value_residual = maybe_cross_attn_value_residual, **cross_attn_rotary_pos_emb, return_intermediates = True)
