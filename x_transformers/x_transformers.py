@@ -705,15 +705,18 @@ class RotaryEmbedding(Module):
         base = 10000,
         base_rescale_factor = 1.,
         axial_rotary_embed = False,
-        axial_width = None
+        axial_width = None,
+        mixed_rotary_embed = False
 
     ):
         super().__init__()
         self.axial_rotary_embed = axial_rotary_embed
         self.axial_width = axial_width
+        self.mixed_rotary_embed = mixed_rotary_embed
+        assert mixed_rotary_embed != axial_rotary_embed, "Cannot use both mixed and axial RoPE together."
         # Divide by 2 for axial embedding as we will apply it twice
         
-        if axial_rotary_embed:
+        if axial_rotary_embed and not mixed_rotary_embed:
             dim = dim // 2
         # proposed by reddit user bloc97, to rescale rotary embeddings to longer sequence length without fine-tuning
         # has some connection to NTK literature
@@ -721,7 +724,13 @@ class RotaryEmbedding(Module):
         base *= base_rescale_factor ** (dim / (dim - 2))
 
         inv_freq = 1. / (base ** (arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
+        if mixed_rotary_embed:
+            self.register_buffer('inv_freq_x', inv_freq)
+            inv_freq_y = 1. / ((base+1) ** (arange(0, dim, 2).float() / dim))
+            self.register_buffer('inv_freq_y', inv_freq_y)
+        else:   
+            self.register_buffer('inv_freq', inv_freq)
+        
 
         assert interpolation_factor >= 1.
         self.interpolation_factor = interpolation_factor
@@ -740,14 +749,30 @@ class RotaryEmbedding(Module):
 
         t = arange(seq_len, device = device)
         return self.forward(t)
+    
+    @autocast('cuda', enabled = False)
+    def forward_mixed(self, tx, ty, offset = 0):
+            if tx.ndim == 1:
+                tx = rearrange(tx, 'n -> 1 n')
+            if ty.ndim == 1:
+                ty = rearrange(ty, 'n -> 1 n')
 
+            freqs_x = torch.einsum('b i , j -> b i j', tx.type_as(self.inv_freq_x), self.inv_freq_x)
+            freqs_y = torch.einsum('b i , j -> b i j', ty.type_as(self.inv_freq_y), self.inv_freq_y)
+            
+            freqs = freqs_x + freqs_y
+            
+            freqs = stack((freqs, freqs), dim = -1)
+            freqs = rearrange(freqs, '... d r -> ... (d r)')
+            return freqs, 1.
+    
     @autocast('cuda', enabled = False)
     def forward(self, t, offset = 0):
         max_pos = t.max() + 1
 
         if t.ndim == 1:
             t = rearrange(t, 'n -> 1 n')
-
+    
         freqs = torch.einsum('b i , j -> b i j', t.type_as(self.inv_freq), self.inv_freq) / self.interpolation_factor
         freqs = stack((freqs, freqs), dim = -1)
         freqs = rearrange(freqs, '... d r -> ... (d r)')
@@ -2272,6 +2297,7 @@ class AttentionLayers(Module):
         rotate_num_heads = None,
         axial_rotary_embed = False,
         axial_width = None,
+        mixed_rotary_embed = False,
         polar_pos_emb = False,
         polar_bias_uniform_init = False,
         weight_tie_layers = False,
@@ -2366,7 +2392,7 @@ class AttentionLayers(Module):
             logger.warning('when training language model, rotary embedding dimension should be at least 32')
         assert at_most_one_of(rotary_pos_emb, polar_pos_emb), f'either rotary positional embedding or polar positional embedding can be turned on'
         assert not (rotary_xpos and not causal), 'rotary xpos is not compatible with bidirectional attention'
-        self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim, use_xpos = rotary_xpos, scale_base = rotary_xpos_scale_base, interpolation_factor = rotary_interpolation_factor, base_rescale_factor = rotary_base_rescale_factor, axial_rotary_embed = axial_rotary_embed, axial_width=axial_width) if rotary_pos_emb else None
+        self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim, use_xpos = rotary_xpos, scale_base = rotary_xpos_scale_base, interpolation_factor = rotary_interpolation_factor, base_rescale_factor = rotary_base_rescale_factor, axial_rotary_embed = axial_rotary_embed, axial_width=axial_width, mixed_rotary_embed=mixed_rotary_embed) if rotary_pos_emb else None
 
         # polar positional embedding (PoPE) - https://arxiv.org/abs/2509.10534
 
@@ -2807,10 +2833,9 @@ class AttentionLayers(Module):
             if not exists(rotary_pos_emb):
                 maybe_mem = first(mems, None) # todo - handle edge case where different layers get different memory lengths. don't think this will ever come up but who knows
                 mem_len = maybe_mem.shape[1] if exists(maybe_mem) else 0
-                
                 if not exists(pos):
                     pos = arange(x.shape[1] + mem_len + seq_pos_offset, device = x.device) - mem_len
-                    if self.rotary_pos_emb.axial_rotary_embed:
+                    if self.rotary_pos_emb.axial_rotary_embed or self.rotary_pos_emb.mixed_rotary_embed:
                         posx, posy = compute_posx_posy(pos, axial_width=self.rotary_pos_emb.axial_width)
                         posx = posx.to(x.device)
                         posy = posy.to(x.device)
@@ -2818,6 +2843,8 @@ class AttentionLayers(Module):
                     posx, scalex  = self.rotary_pos_emb(posx)
                     posy, _ = self.rotary_pos_emb(posy)
                     rotary_pos_emb = (torch.cat((posx, posy), dim=2),  scalex)
+                elif self.rotary_pos_emb.mixed_rotary_embed:
+                    pos, scalex  = self.rotary_pos_emb.forward_mixed(posx, posy)
                 else:
                     rotary_pos_emb = self.rotary_pos_emb(pos)
 
