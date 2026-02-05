@@ -695,6 +695,23 @@ class PerRowDataDependentAlibi(Module):
 
         return forget_gates
 
+
+def init_2d_freqs(dim: int, num_heads: int, theta: float = 10.0, rotate: bool = True):
+    freqs_x = []
+    freqs_y = []
+    mag = 1 / (theta ** (torch.arange(0, dim, 4)[: (dim // 4)].float() / dim))
+    for i in range(num_heads):
+        angles = torch.rand(1) * 2 * torch.pi if rotate else torch.zeros(1)    
+        fx = torch.cat([mag * torch.cos(angles), mag * torch.cos(torch.pi/2 + angles)], dim=-1)
+        fy = torch.cat([mag * torch.sin(angles), mag * torch.sin(torch.pi/2 + angles)], dim=-1)
+        freqs_x.append(fx)
+        freqs_y.append(fy)
+    freqs_x = torch.stack(freqs_x, dim=0)
+    freqs_y = torch.stack(freqs_y, dim=0)
+    freqs = torch.stack([freqs_x, freqs_y], dim=0)
+    return freqs
+
+
 class RotaryEmbedding(Module):
     def __init__(
         self,
@@ -725,9 +742,9 @@ class RotaryEmbedding(Module):
 
         inv_freq = 1. / (base ** (arange(0, dim, 2).float() / dim))
         if mixed_rotary_embed:
-            self.register_buffer('inv_freq_x', inv_freq)
-            inv_freq_y = 1. / ((base+1) ** (arange(0, dim, 2).float() / dim))
-            self.register_buffer('inv_freq_y', inv_freq_y)
+            freq = init_2d_freqs(dim, 8, base, rotate = True)
+            self.inv_freq_x = nn.Parameter(freq[0], requires_grad=True)
+            self.inv_freq_y = nn.Parameter(freq[1], requires_grad=True)
         else:   
             self.register_buffer('inv_freq', inv_freq)
         
@@ -757,8 +774,8 @@ class RotaryEmbedding(Module):
             if ty.ndim == 1:
                 ty = rearrange(ty, 'n -> 1 n')
 
-            freqs_x = torch.einsum('b i , j -> b i j', tx.type_as(self.inv_freq_x), self.inv_freq_x)
-            freqs_y = torch.einsum('b i , j -> b i j', ty.type_as(self.inv_freq_y), self.inv_freq_y)
+            freqs_x = torch.einsum('b i , h j -> b h i j', tx.type_as(self.inv_freq_x), self.inv_freq_x)
+            freqs_y = torch.einsum('b i , h j -> b h i j', ty.type_as(self.inv_freq_y), self.inv_freq_y)
             
             freqs = freqs_x + freqs_y
             
